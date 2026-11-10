@@ -1,0 +1,15 @@
+[
+    "unauthenticated",
+    "token_missing_ability",
+    "forbidden",
+    "account_inactive",
+    "service_suspended",
+    "not_found",
+    "conflict",
+    "validation_failed",
+    "unsupported",
+    "rate_limited",
+    "server_error",
+    "upstream_unavailable",
+    "staff_setup_required"
+]
