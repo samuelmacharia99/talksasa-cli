@@ -32,6 +32,8 @@ type App struct {
 	Stderr io.Writer
 
 	StdinIsTerminal bool
+	// StderrIsTerminal turns on progress lines that redraw in place.
+	StderrIsTerminal bool
 	// ReadPassword reads a line from the terminal without echoing it.
 	ReadPassword func() (string, error)
 	// Getwd is the folder link files are looked for from.
@@ -40,6 +42,9 @@ type App struct {
 	Version string
 	// PollInterval is how often --wait and --follow ask again.
 	PollInterval time.Duration
+	// RetryDelay is the first wait before an upload request is tried
+	// again; it doubles each time, up to 30 times itself.
+	RetryDelay time.Duration
 
 	in    *bufio.Reader
 	flags struct {
@@ -59,6 +64,7 @@ func NewApp(version string) *App {
 		Getwd:        os.Getwd,
 		Version:      version,
 		PollInterval: 4 * time.Second,
+		RetryDelay:   time.Second,
 	}
 }
 
@@ -66,8 +72,9 @@ func (a *App) userAgent() string {
 	return fmt.Sprintf("talksasa-cli/%s (%s/%s)", a.Version, runtime.GOOS, runtime.GOARCH)
 }
 
-const rootLong = `Run your Talksasa apps from a terminal or CI: status, logs, deploys,
-environment variables, domains and backups.
+const rootLong = `Run your Talksasa apps from a terminal or CI: status, logs, deploys
+from Git or straight from a folder, environment variables, domains and
+backups.
 
 Sign in once with "talksasa login", using a token from Developers in the
 portal. In CI, set TALKSASA_TOKEN instead; nothing is stored then.
@@ -127,7 +134,7 @@ func (a *App) Command() *cobra.Command {
 		c.GroupID = "apps"
 		root.AddCommand(c)
 	}
-	for _, c := range []*cobra.Command{a.deployCmd(), a.redeployCmd(), a.backupsCmd()} {
+	for _, c := range []*cobra.Command{a.deployCmd(), a.redeployCmd(), a.releasesCmd(), a.backupsCmd()} {
 		c.GroupID = "ship"
 		root.AddCommand(c)
 	}

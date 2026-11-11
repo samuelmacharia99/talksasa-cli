@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -94,14 +95,96 @@ type Pull struct {
 		Details  string `json:"details"`
 	} `json:"error"`
 	LogTail []string `json:"log_tail"`
+	// Source is where the pull's code came from: "git" or "upload" (an
+	// older platform sends neither). Release is the uploaded release.
+	Source  string   `json:"source"`
+	Release *Release `json:"release"`
 }
+
+// Code sources an app can have.
+const (
+	SourceGit    = "git"
+	SourceUpload = "upload"
+)
 
 type PullStatus struct {
 	Repository struct {
 		URL    *string `json:"url"`
 		Branch *string `json:"branch"`
 	} `json:"repository"`
-	Pull *Pull `json:"pull"`
+	// CodeSource is where the app's code comes from: "git", "upload", or
+	// nil for neither yet.
+	CodeSource *string `json:"code_source"`
+	Pull       *Pull   `json:"pull"`
+}
+
+// Upload is a code bundle being sent in chunks.
+type Upload struct {
+	ID            int    `json:"id"`
+	Status        string `json:"status"`
+	SizeBytes     int64  `json:"size_bytes"`
+	ReceivedBytes int64  `json:"received_bytes"`
+	SHA256        string `json:"sha256"`
+	// ChunkBytes is the most one chunk may carry. Always use the server's.
+	ChunkBytes    int64   `json:"chunk_bytes"`
+	ReleaseNumber *int    `json:"release_number"`
+	ExpiresAt     *string `json:"expires_at"`
+}
+
+// Upload statuses.
+const (
+	UploadUploading = "uploading"
+	UploadReceived  = "received"
+	UploadStored    = "stored"
+	UploadDeployed  = "deployed"
+	UploadExpired   = "expired"
+	UploadCancelled = "cancelled"
+)
+
+// NewUpload declares a bundle before it is sent.
+type NewUpload struct {
+	SizeBytes     int64  `json:"size_bytes"`
+	SHA256        string `json:"sha256"`
+	UnpackedBytes *int64 `json:"unpacked_bytes,omitempty"`
+	FileCount     *int   `json:"file_count,omitempty"`
+	// ReplaceGit needs a token with the Destructive permission.
+	ReplaceGit bool `json:"replace_git,omitempty"`
+}
+
+// Chunk is the answer to one chunk.
+type Chunk struct {
+	ReceivedBytes int64 `json:"received_bytes"`
+	SizeBytes     int64 `json:"size_bytes"`
+	Complete      bool  `json:"complete"`
+}
+
+// UploadDeployOptions are the deploy's options. The server's defaults are
+// composer and migrations on, so every field is always sent.
+type UploadDeployOptions struct {
+	RunComposer   bool `json:"run_composer"`
+	RunMigrations bool `json:"run_migrations"`
+	ForceRebuild  bool `json:"force_rebuild"`
+	ReplaceGit    bool `json:"replace_git"`
+}
+
+// Release is an uploaded bundle the app received or keeps.
+type Release struct {
+	ID             int     `json:"id"`
+	Number         *int    `json:"number"`
+	Status         string  `json:"status"`
+	IsLive         bool    `json:"is_live"`
+	Kept           bool    `json:"kept"`
+	SHA256         string  `json:"sha256"`
+	SizeBytes      int64   `json:"size_bytes"`
+	UnpackedBytes  *int64  `json:"unpacked_bytes"`
+	FileCount      *int    `json:"file_count"`
+	UploadedAt     *string `json:"uploaded_at"`
+	LastDeployedAt *string `json:"last_deployed_at"`
+}
+
+type Releases struct {
+	CodeSource *string   `json:"code_source"`
+	Releases   []Release `json:"releases"`
 }
 
 // Deployment is the progress of an app's latest deploy attempt.
@@ -317,6 +400,57 @@ func (c *Client) RestoreStatus(ctx context.Context, id, restoreID int) (*Respons
 
 func (c *Client) DeleteBackup(ctx context.Context, id, backupID int) (*Response, error) {
 	return c.Do(ctx, http.MethodDelete, containerPath(id, "backups/"+strconv.Itoa(backupID)), nil, nil)
+}
+
+func uploadPath(id, uploadID int, suffix string) string {
+	p := "uploads/" + strconv.Itoa(uploadID)
+	if suffix != "" {
+		p += "/" + suffix
+	}
+	return containerPath(id, p)
+}
+
+// CreateUpload declares a bundle. A 200 answer (rather than 201) resumes
+// one this user already part-sent: carry on from ReceivedBytes.
+func (c *Client) CreateUpload(ctx context.Context, id int, u NewUpload) (*Response, Upload, error) {
+	return call[Upload](ctx, c, http.MethodPost, containerPath(id, "uploads"), nil, u)
+}
+
+// UploadChunk sends length bytes of body as the chunk at offset. It runs
+// under RawTimeout rather than the client's usual timeout.
+func (c *Client) UploadChunk(ctx context.Context, id, uploadID int, offset int64, body io.Reader, length int64) (*Response, Chunk, error) {
+	query := url.Values{"offset": {strconv.FormatInt(offset, 10)}}
+	resp, err := c.DoRaw(ctx, http.MethodPut, uploadPath(id, uploadID, "chunk"), query, body, length, "application/octet-stream")
+	if err != nil {
+		return nil, Chunk{}, err
+	}
+	out, err := Decode[Chunk](resp)
+	return resp, out, err
+}
+
+func (c *Client) GetUpload(ctx context.Context, id, uploadID int) (*Response, Upload, error) {
+	return call[Upload](ctx, c, http.MethodGet, uploadPath(id, uploadID, ""), nil, nil)
+}
+
+// CancelUpload stops an upload still being sent.
+func (c *Client) CancelUpload(ctx context.Context, id, uploadID int) (*Response, Upload, error) {
+	return call[Upload](ctx, c, http.MethodDelete, uploadPath(id, uploadID, ""), nil, nil)
+}
+
+// DeployUpload checks a fully sent bundle and deploys it. Asking again
+// while that deploy runs answers with the same pull.
+func (c *Client) DeployUpload(ctx context.Context, id, uploadID int, opts UploadDeployOptions) (*Response, Pull, error) {
+	return call[Pull](ctx, c, http.MethodPost, uploadPath(id, uploadID, "deploy"), nil, opts)
+}
+
+// Releases lists the app's uploaded releases, newest first.
+func (c *Client) Releases(ctx context.Context, id int) (*Response, Releases, error) {
+	return call[Releases](ctx, c, http.MethodGet, containerPath(id, "releases"), nil, nil)
+}
+
+// DeployRelease deploys a kept release again.
+func (c *Client) DeployRelease(ctx context.Context, id, releaseID int) (*Response, Pull, error) {
+	return call[Pull](ctx, c, http.MethodPost, containerPath(id, "releases/"+strconv.Itoa(releaseID)+"/deploy"), nil, nil)
 }
 
 func call[T any](ctx context.Context, c *Client, method, path string, query url.Values, body any) (*Response, T, error) {

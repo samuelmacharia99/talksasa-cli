@@ -38,6 +38,7 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.Method + " " + strings.TrimPrefix(r.URL.Path, "/api/v1")
 		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body)) // handlers may read it too
 
 		f.mu.Lock()
 		handler, ok := f.routes[key]
@@ -61,6 +62,8 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 }
 
 func (f *fakeAPI) on(route string, handler func(w http.ResponseWriter, r *http.Request, n int)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.routes[route] = handler
 }
 
@@ -124,6 +127,8 @@ type harness struct {
 	cfg  string
 	tty  bool
 	pass string
+	// errTTY makes stderr count as a terminal (progress lines).
+	errTTY bool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -143,13 +148,15 @@ func (h *harness) run(stdin string, args ...string) run {
 func (h *harness) runContext(ctx context.Context, stdin string, args ...string) run {
 	var stdout, stderr bytes.Buffer
 	app := &App{
-		Stdin:           strings.NewReader(stdin),
-		Stdout:          &stdout,
-		Stderr:          &stderr,
-		Getwd:           func() (string, error) { return h.dir, nil },
-		Version:         "test",
-		PollInterval:    time.Millisecond,
-		StdinIsTerminal: h.tty,
+		Stdin:            strings.NewReader(stdin),
+		Stdout:           &stdout,
+		Stderr:           &stderr,
+		Getwd:            func() (string, error) { return h.dir, nil },
+		Version:          "test",
+		PollInterval:     time.Millisecond,
+		RetryDelay:       time.Millisecond,
+		StdinIsTerminal:  h.tty,
+		StderrIsTerminal: h.errTTY,
 	}
 	if h.tty {
 		app.ReadPassword = func() (string, error) { return h.pass, nil }

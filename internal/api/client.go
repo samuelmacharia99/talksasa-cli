@@ -31,6 +31,8 @@ type Client struct {
 	Token     string
 	UserAgent string
 	HTTP      *http.Client
+	// RawTimeout bounds one DoRaw request (RawRequestTimeout when zero).
+	RawTimeout time.Duration
 }
 
 // New returns a client with redirects refused: a redirect to another host
@@ -88,6 +90,29 @@ func (e *Error) Bool(key string) bool {
 	return v
 }
 
+// Int64 reads a whole number from the answer's extra fields, such as
+// received_bytes on a refused chunk.
+func (e *Error) Int64(key string) (int64, bool) {
+	raw, ok := e.Extra[key]
+	if !ok {
+		return 0, false
+	}
+	var v int64
+	if json.Unmarshal(raw, &v) != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// Text reads a string from the answer's extra fields, such as status.
+func (e *Error) Text(key string) string {
+	var v string
+	if raw, ok := e.Extra[key]; ok {
+		_ = json.Unmarshal(raw, &v)
+	}
+	return v
+}
+
 // NetworkError is a failure to reach the API at all.
 type NetworkError struct {
 	URL string
@@ -117,29 +142,90 @@ func (c *Client) Get(ctx context.Context, path string, query url.Values) (*Respo
 	return c.Do(ctx, http.MethodGet, path, query, nil)
 }
 
+// RawRequestTimeout bounds one DoRaw request when its context has no
+// sooner deadline: a 4 MiB chunk on a slow link takes far longer than the
+// client's usual 90 seconds.
+const RawRequestTimeout = 5 * time.Minute
+
 // Do calls the API. body, when not nil, is sent as JSON.
 func (c *Client) Do(ctx context.Context, method, path string, query url.Values, body any) (*Response, error) {
-	target := c.BaseURL + "/" + strings.TrimLeft(path, "/")
-	if len(query) > 0 {
-		target += "?" + query.Encode()
-	}
-
 	var reader io.Reader
+	var length int64
+	contentType := ""
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("encode request: %w", err)
 		}
-		reader = bytes.NewReader(encoded)
+		reader, length, contentType = bytes.NewReader(encoded), int64(len(encoded)), "application/json"
+	}
+	req, target, err := c.newRequest(ctx, method, path, query, reader, length, contentType)
+	if err != nil {
+		return nil, err
+	}
+	return c.send(ctx, c.httpClient(), req, target)
+}
+
+// DoRaw sends body as it is: length bytes of contentType, such as a chunk
+// of a file. The answer is decoded as Do's is.
+//
+// The client's own timeout does not apply. The request gets RawTimeout
+// (RawRequestTimeout when unset) unless ctx ends sooner; running out of it
+// is a *NetworkError, and ctx being cancelled returns ctx's error.
+//
+// An *io.SectionReader body can be sent again by the transport on a
+// connection that was closed under it; other readers are sent once.
+func (c *Client) DoRaw(ctx context.Context, method, path string, query url.Values, body io.Reader, length int64, contentType string) (*Response, error) {
+	timeout := c.RawTimeout
+	if timeout <= 0 {
+		timeout = RawRequestTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, target, err := c.newRequest(reqCtx, method, path, query, body, length, contentType)
+	if err != nil {
+		return nil, err
+	}
+	hc := *c.httpClient()
+	hc.Timeout = 0
+	return c.send(ctx, &hc, req, target)
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return http.DefaultClient
+}
+
+// newRequest builds a request to path (relative to the base URL) with the
+// API's headers. A non-nil body is sent with Content-Length length.
+func (c *Client) newRequest(ctx context.Context, method, path string, query url.Values, body io.Reader, length int64, contentType string) (*http.Request, string, error) {
+	target := c.BaseURL + "/" + strings.TrimLeft(path, "/")
+	if len(query) > 0 {
+		target += "?" + query.Encode()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, target, reader)
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, "", fmt.Errorf("build request: %w", err)
+	}
+	if body != nil {
+		req.ContentLength = length
+		if length == 0 {
+			req.Body = http.NoBody
+		}
+		if section, ok := body.(*io.SectionReader); ok {
+			outer, off, n := section.Outer()
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(io.NewSectionReader(outer, off, n)), nil
+			}
+		}
 	}
 	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
@@ -147,8 +233,13 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	if c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
+	return req, target, nil
+}
 
-	resp, err := c.HTTP.Do(req)
+// send makes the request and decodes the answer. ctx is the caller's: when
+// it is the one that ended, its error is returned rather than a network one.
+func (c *Client) send(ctx context.Context, hc *http.Client, req *http.Request, target string) (*Response, error) {
+	resp, err := hc.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -159,6 +250,9 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes+1))
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, &NetworkError{URL: target, Err: err}
 	}
 	if len(raw) > MaxResponseBytes {

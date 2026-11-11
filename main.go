@@ -14,6 +14,7 @@ var version = "dev"
 
 func main() {
 	app := cli.NewApp(version)
+	app.StderrIsTerminal = term.IsTerminal(int(os.Stderr.Fd()))
 	fd := int(os.Stdin.Fd())
 	if term.IsTerminal(fd) {
 		app.StdinIsTerminal = true

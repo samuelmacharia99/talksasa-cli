@@ -81,6 +81,11 @@ expect 0 "domains" "$T" domains
 expect 0 "metrics" "$T" metrics
 expect 0 "backups" "$T" backups
 expect 0 "deploy status" "$T" deploy status
+expect 0 "releases" "$T" releases
+mkdir -p "$work/site" && printf '<h1>e2e</h1>\n' >"$work/site/index.html" && printf 'X=1\n' >"$work/site/.env"
+expect 0 "deploy --dir --dry-run sends nothing" "$T" deploy --dir "$work/site" --dry-run
+expect_out "index.html" "the dry run lists the folder's files"
+expect 2 "--replace-git needs --dir" "$T" deploy --replace-git
 expect 5 "a backup that is not there" "$T" backups restore 999999999 --yes
 expect 2 "stop asks first" "$T" stop
 expect 4 "another customer's app" "$T" status --app 1

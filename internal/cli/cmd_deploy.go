@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -14,14 +15,21 @@ import (
 // errorLogLines is how much of a failed pull's log is printed.
 const errorLogLines = 40
 
+// deployOptions are deploy's flags; --dir and the two after it are the
+// upload path (cmd_deploy_upload.go).
+type deployOptions struct {
+	replace, noComposer, noMigrations, rebuild, noWait bool
+	timeout                                            time.Duration
+
+	dir                string
+	replaceGit, dryRun bool
+}
+
 func (a *App) deployCmd() *cobra.Command {
-	var opts struct {
-		replace, noComposer, noMigrations, rebuild, noWait bool
-		timeout                                            time.Duration
-	}
+	opts := &deployOptions{}
 	cmd := &cobra.Command{
 		Use:   "deploy",
-		Short: "Pull the connected Git branch and deploy it",
+		Short: "Deploy the connected Git branch, or a folder with --dir",
 		Long: `Pull the app's connected Git branch and deploy it, as the portal's Pull
 button does: the code is checked again before anything restarts.
 
@@ -29,10 +37,31 @@ It waits until the pull ends and exits non-zero if it failed, so a CI job
 fails with it. --no-wait returns once the pull is queued.
 
 --replace deletes /app and clones the repository fresh. It needs a token
-with the Destructive permission, and asks first.`,
+with the Destructive permission, and asks first.
+
+--dir deploys a folder instead, with no Git host: it is packed (leaving out
+what .gitignore and .talksasaignore exclude, .git, node_modules, .env and
+the like), uploaded, and deployed through the same pipeline as a pull. An
+interrupted upload resumes when the same command runs again. It needs a
+token with the Upload code permission. --dry-run lists what would be
+uploaded and sends nothing. An app connected to Git refuses uploads until
+--replace-git disconnects it (Destructive permission; asks first).`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
+			if cmd.Flags().Changed("dir") {
+				if err := validateDirFlags(opts); err != nil {
+					return err
+				}
+				return a.deployDir(ctx, opts)
+			}
+			if opts.replaceGit {
+				return &usageError{msg: "--replace-git goes with --dir: talksasa deploy --dir . --replace-git"}
+			}
+			if opts.dryRun {
+				return &usageError{msg: "--dry-run goes with --dir: talksasa deploy --dir . --dry-run"}
+			}
+
 			c, t, err := a.appClient(ctx)
 			if err != nil {
 				return err
@@ -50,7 +79,7 @@ with the Destructive permission, and asks first.`,
 				ForceRebuild:    opts.rebuild,
 			})
 			if err != nil {
-				return err
+				return a.explainPullRefusal(ctx, c, t, err)
 			}
 			if opts.noWait {
 				if a.flags.json {
@@ -70,11 +99,28 @@ with the Destructive permission, and asks first.`,
 	f.BoolVar(&opts.noComposer, "no-composer", false, "skip composer install")
 	f.BoolVar(&opts.noMigrations, "no-migrations", false, "skip database migrations")
 	f.BoolVar(&opts.rebuild, "rebuild", false, "rebuild the image even when nothing changed")
-	f.BoolVar(&opts.noWait, "no-wait", false, "return once the pull is queued")
-	f.DurationVar(&opts.timeout, "timeout", 30*time.Minute, "how long to wait for the pull")
+	f.BoolVar(&opts.noWait, "no-wait", false, "return once the deploy is queued")
+	f.DurationVar(&opts.timeout, "timeout", 30*time.Minute, "how long to wait for the deploy")
+	f.StringVar(&opts.dir, "dir", "", "deploy this folder instead of pulling from Git (Upload code permission)")
+	f.BoolVar(&opts.replaceGit, "replace-git", false, "with --dir: disconnect the app's Git repository and auto-deploy (Destructive permission)")
+	f.BoolVar(&opts.dryRun, "dry-run", false, "with --dir: list what would be uploaded, and send nothing")
 
 	cmd.AddCommand(a.deployStatusCmd())
 	return cmd
+}
+
+// explainPullRefusal adds a hint to a refused Git pull when the app's code
+// is uploaded rather than pulled.
+func (a *App) explainPullRefusal(ctx context.Context, c *api.Client, t target, err error) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "conflict" {
+		return err
+	}
+	_, status, perr := c.PullStatus(ctx, t.ID)
+	if perr != nil || status.CodeSource == nil || *status.CodeSource != api.SourceUpload {
+		return err
+	}
+	return fmt.Errorf("%w\nThis app deploys uploads: run talksasa deploy --dir .", err)
 }
 
 // waitForPull follows one pull until it ends, printing its steps.
@@ -113,13 +159,18 @@ func (a *App) waitForPull(ctx context.Context, c *api.Client, t target, pullID i
 		}
 	}
 	if final.Status == "completed" {
-		if !a.flags.json {
-			commit := ""
-			if final.Commit != nil && *final.Commit != "" {
-				commit = " at " + shortCommit(*final.Commit)
-			}
-			a.out("Deployed %s%s.", t, commit)
+		if a.flags.json {
+			return nil
 		}
+		if r := final.Release; final.Source == api.SourceUpload && r != nil && r.Number != nil {
+			a.out("Deployed %s release %d (sha256 %s).", t, *r.Number, shortCommit(r.SHA256))
+			return nil
+		}
+		commit := ""
+		if final.Commit != nil && *final.Commit != "" {
+			commit = " at " + shortCommit(*final.Commit)
+		}
+		a.out("Deployed %s%s.", t, commit)
 		return nil
 	}
 
@@ -180,18 +231,24 @@ func (a *App) deployStatusCmd() *cobra.Command {
 			if a.flags.json {
 				return a.printBody(resp)
 			}
-			repo := str(status.Repository.URL)
-			if status.Repository.Branch != nil && *status.Repository.Branch != "" {
-				repo += " (" + *status.Repository.Branch + ")"
+			if status.CodeSource != nil && *status.CodeSource == api.SourceUpload {
+				a.out("Code: uploaded with talksasa deploy --dir (list releases with: talksasa releases)")
+			} else {
+				repo := str(status.Repository.URL)
+				if status.Repository.Branch != nil && *status.Repository.Branch != "" {
+					repo += " (" + *status.Repository.Branch + ")"
+				}
+				a.out("Repository: %s", repo)
 			}
-			a.out("Repository: %s", repo)
 			if status.Pull == nil {
 				a.out("No pull yet.")
 				return nil
 			}
 			p := status.Pull
 			a.out("Pull #%d: %s (started %s, finished %s)", p.ID, p.Status, when(p.StartedAt), when(p.CompletedAt))
-			if p.Commit != nil && *p.Commit != "" {
+			if r := p.Release; p.Source == api.SourceUpload && r != nil && r.Number != nil {
+				a.out("Release: %d (sha256 %s)", *r.Number, shortCommit(r.SHA256))
+			} else if p.Commit != nil && *p.Commit != "" {
 				a.out("Commit: %s", shortCommit(*p.Commit))
 			}
 			for _, step := range p.Steps {
